@@ -3,6 +3,7 @@ from typing import Optional, Union
 
 import torch
 from torch import nn
+import torch.nn.functional as F
 from torch.nn import CrossEntropyLoss
 
 from ...activations import ACT2FN
@@ -194,6 +195,10 @@ class Wav2Vec2BertSelfAttention(Wav2Vec2ConformerSelfAttention, nn.Module):
         self.head_size = hidden_size // config.num_attention_heads
         self.num_heads = config.num_attention_heads
         self.position_embeddings_type = config.position_embeddings_type if not is_adapter_attention else None
+        
+        # Determine attention implementation
+        # Adapters always use eager (simpler, no position embeddings)
+        self.attn_implementation = "eager" if is_adapter_attention else getattr(config, "attn_implementation", "eager")
 
         self.linear_q = nn.Linear(hidden_size, hidden_size)
         self.linear_k = nn.Linear(hidden_size, hidden_size)
@@ -222,7 +227,7 @@ class Wav2Vec2BertSelfAttention(Wav2Vec2ConformerSelfAttention, nn.Module):
         attention_mask: Optional[torch.Tensor] = None,
         relative_position_embeddings: Optional[torch.Tensor] = None,
         output_attentions: bool = False,
-    ) -> tuple[torch.Tensor, Optional[torch.Tensor], Optional[tuple[torch.Tensor]]]:
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
         # self-attention mechanism
         batch_size, sequence_length, hidden_size = hidden_states.size()
 
@@ -247,11 +252,39 @@ class Wav2Vec2BertSelfAttention(Wav2Vec2ConformerSelfAttention, nn.Module):
         key = key.transpose(1, 2)
         value = value.transpose(1, 2)
 
+        # Choose attention implementation path
+        if self.attn_implementation == "sdpa" and not output_attentions:
+            # SDPA path - optimized attention
+            hidden_states = self._sdpa_attention(
+                query, key, value, attention_mask, relative_position_embeddings
+            )
+            attn_weights = None
+        else:
+            # Eager path - manual attention computation
+            hidden_states, attn_weights = self._eager_attention(
+                query, key, value, attention_mask, relative_position_embeddings, output_attentions
+            )
+
+        # => (batch, time1, hidden_size)
+        hidden_states = hidden_states.transpose(1, 2).reshape(batch_size, -1, self.num_heads * self.head_size)
+        hidden_states = self.linear_out(hidden_states)
+
+        return hidden_states, attn_weights
+
+    def _eager_attention(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        attention_mask: Optional[torch.Tensor],
+        relative_position_embeddings: Optional[torch.Tensor],
+        output_attentions: bool,
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """Original eager attention implementation."""
         if self.position_embeddings_type == "relative":
             if relative_position_embeddings is None:
                 raise ValueError(
-                    "`relative_position_embeddings` has to be defined when `self.position_embeddings_type =="
-                    " 'relative'"
+                    "`relative_position_embeddings` has to be defined when `self.position_embeddings_type == 'relative'"
                 )
             # apply relative_position_embeddings to qk scores
             # as proposed in Transformer_XL: https://huggingface.co/papers/1901.02860
@@ -264,8 +297,8 @@ class Wav2Vec2BertSelfAttention(Wav2Vec2ConformerSelfAttention, nn.Module):
         if self.position_embeddings_type == "relative_key":
             query_length, key_length = query.shape[2], key.shape[2]
 
-            position_ids_l = torch.arange(query_length, dtype=torch.long, device=hidden_states.device).view(-1, 1)
-            position_ids_r = torch.arange(key_length, dtype=torch.long, device=hidden_states.device).view(1, -1)
+            position_ids_l = torch.arange(query_length, dtype=torch.long, device=query.device).view(-1, 1)
+            position_ids_r = torch.arange(key_length, dtype=torch.long, device=query.device).view(1, -1)
             distance = position_ids_r - position_ids_l
             distance = torch.clamp(distance, -self.left_max_position_embeddings, self.right_max_position_embeddings)
 
@@ -286,11 +319,76 @@ class Wav2Vec2BertSelfAttention(Wav2Vec2ConformerSelfAttention, nn.Module):
         # => (batch, head, time1, d_k)
         hidden_states = torch.matmul(probs, value)
 
-        # => (batch, time1, hidden_size)
-        hidden_states = hidden_states.transpose(1, 2).reshape(batch_size, -1, self.num_heads * self.head_size)
-        hidden_states = self.linear_out(hidden_states)
+        return hidden_states, probs if output_attentions else None
 
-        return hidden_states, probs
+    def _sdpa_attention(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        attention_mask: Optional[torch.Tensor],
+        relative_position_embeddings: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        """SDPA-based attention with hybrid approach for relative_key position embeddings."""
+        attn_bias = None
+
+        if self.position_embeddings_type == "relative":
+            # For Transformer-XL style relative positions, we cannot use SDPA directly
+            # Fall back to eager implementation by computing scores manually
+            if relative_position_embeddings is None:
+                raise ValueError(
+                    "`relative_position_embeddings` has to be defined when `self.position_embeddings_type == 'relative'"
+                )
+            # Compute full scores manually (unavoidable for this position type)
+            scores = self._apply_relative_embeddings(
+                query=query, key=key, relative_position_embeddings=relative_position_embeddings
+            )
+            
+            if attention_mask is not None:
+                scores = scores + attention_mask
+            
+            probs = torch.softmax(scores, dim=-1)
+            probs = self.dropout(probs)
+            hidden_states = torch.matmul(probs, value)
+            return hidden_states
+
+        elif self.position_embeddings_type == "relative_key":
+            # Hybrid approach: compute position bias manually, pass to SDPA
+            query_length, key_length = query.shape[2], key.shape[2]
+
+            position_ids_l = torch.arange(query_length, dtype=torch.long, device=query.device).view(-1, 1)
+            position_ids_r = torch.arange(key_length, dtype=torch.long, device=query.device).view(1, -1)
+            distance = position_ids_r - position_ids_l
+            distance = torch.clamp(distance, -self.left_max_position_embeddings, self.right_max_position_embeddings)
+
+            positional_embedding = self.distance_embedding(distance + self.left_max_position_embeddings)
+            positional_embedding = positional_embedding.to(dtype=query.dtype)  # fp16 compatibility
+
+            # Compute position bias (query-dependent, unavoidable)
+            relative_position_attn_weights = torch.einsum("bhld,lrd->bhlr", query, positional_embedding)
+            position_bias = relative_position_attn_weights / math.sqrt(self.head_size)
+            
+            # Combine with attention mask if provided
+            if attention_mask is not None:
+                # attention_mask is (batch, 1, seq_len, seq_len) with values added to scores
+                # position_bias is (batch, heads, seq_len, seq_len)
+                # We need to combine them for SDPA's attn_mask parameter
+                attn_bias = position_bias + attention_mask
+            else:
+                attn_bias = position_bias
+
+        # Use PyTorch's scaled_dot_product_attention
+        # Note: attn_bias is used instead of attn_mask when we have position bias
+        hidden_states = F.scaled_dot_product_attention(
+            query,
+            key,
+            value,
+            attn_mask=attention_mask if attn_bias is None else attn_bias,
+            dropout_p=self.dropout.p if self.training else 0.0,
+            is_causal=False,
+        )
+
+        return hidden_states
 
 
 class Wav2Vec2BertEncoderLayer(GradientCheckpointingLayer):
