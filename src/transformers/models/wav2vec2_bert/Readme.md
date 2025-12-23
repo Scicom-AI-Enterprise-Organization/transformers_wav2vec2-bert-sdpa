@@ -101,14 +101,15 @@ hidden_states = F.scaled_dot_product_attention(
 )
 ```
 
+
 ## Position Embedding Compatibility
 
-  Type           Status
-  -------------- --------------------------
-  relative_key   Fully supported (hybrid)
-  rotary         Fully supported
-  relative       Fallback to eager
-  none           Pure SDPA
+| Type | SDPA Support | Notes |
+|------|-------------|-------|
+| `relative_key` | ✅ Full (hybrid) | Position bias computed manually, passed to SDPA |
+| `rotary` | ✅ Full | Applied to Q/K before SDPA |
+| `relative` | ⚠️ Fallback | Falls back to eager (mathematically required) |
+| `None` | ✅ Full | Pure SDPA, no position embeddings |
 
 ## Testing
 
